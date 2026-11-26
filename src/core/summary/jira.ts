@@ -1,8 +1,9 @@
 /**
  * 手動任務「從 Jira 整理」：由 `claude -p` 透過使用者已連線的 Jira MCP 讀取單號留言，
- * Worktrail 自己不呼叫 Jira API（規格 1.3）。留言依「內文日期」過濾，詳見 docs/DECISIONS.md。
+ * Worktrail 自己不呼叫 Jira API（規格 1.3）。留言依「內文日期」過濾，內文沒寫日期時改看建立時間，詳見 docs/DECISIONS.md。
  */
 import { z } from 'zod';
+import { localDate } from '../capture/tz.js';
 import { maskSecrets } from './index.js';
 
 export const JiraComment = z.object({
@@ -70,7 +71,14 @@ function isDateHeading(rest: string): boolean {
  * - 第一個日期行之前的內容不屬於任何日期。
  */
 export function sectionsForDate(body: string, date: string): string[] {
-  const year = date.slice(0, 4);
+  return dateSections(body, date.slice(0, 4))
+    .filter((s) => s.date === date)
+    .map((s) => s.lines.join('\n').trim())
+    .filter(Boolean);
+}
+
+/** 依日期行切出的段落（不過濾）；沒有任何日期行時為空陣列 */
+function dateSections(body: string, year: string): { date: string; lines: string[] }[] {
   const lines = body.replace(/\r\n/g, '\n').split('\n');
   const sections: { date: string; lines: string[] }[] = [];
   let firstContent = true;
@@ -84,19 +92,41 @@ export function sectionsForDate(body: string, date: string): string[] {
     }
     sections.at(-1)?.lines.push(line);
   }
-  return sections
-    .filter((s) => s.date === date)
-    .map((s) => s.lines.join('\n').trim())
-    .filter(Boolean);
+  return sections;
+}
+
+/** 留言建立時間（Jira 格式如 2026-11-25T10:04:44.215+0800）在 tz 的日期；無法解析時回傳 null */
+export function createdLocalDate(created: string, tz: string): string | null {
+  const s = created.trim();
+  if (!s) return null;
+  const ts = Date.parse(s.replace(/([+-]\d{2})(\d{2})$/, '$1:$2'));
+  if (Number.isFinite(ts)) return localDate(ts, tz);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+/**
+ * 取出留言中屬於 date 的內容：
+ * - 內文有日期行：依內文日期分段（內文日期優先，留言建立時間不影響）。
+ * - 內文完全沒有日期行：依留言建立時間（tz 時區）判斷，當天建立的整則留言納入。
+ */
+export function commentSectionsForDate(c: JiraComment, date: string, tz: string): string[] {
+  if (dateSections(c.body, date.slice(0, 4)).length) return sectionsForDate(c.body, date);
+  const body = c.body.trim();
+  return body && createdLocalDate(c.created, tz) === date ? [body] : [];
 }
 
 /** 組成給摘要範本的「內容」區塊；沒有符合日期的留言時回傳 null */
-export function formatJiraContent(ticket: string, fetched: JiraFetchResult, date: string): { text: string; count: number } | null {
+export function formatJiraContent(
+  ticket: string,
+  fetched: JiraFetchResult,
+  date: string,
+  tz: string,
+): { text: string; count: number } | null {
   const parts: string[] = [];
   for (const c of fetched.comments) {
-    for (const s of sectionsForDate(c.body, date)) parts.push(`### ${c.author || '（未知）'} 的留言\n${s}`);
+    for (const s of commentSectionsForDate(c, date, tz)) parts.push(`### ${c.author || '（未知）'} 的留言\n${s}`);
   }
   if (!parts.length) return null;
-  const head = `以下是 Jira 單號 ${ticket}${fetched.summary ? `「${fetched.summary}」` : ''}中，內文標示為 ${date} 的留言（不是對話紀錄）。請依這些留言整理當天的工作子項，不要編造留言中沒有的內容。`;
+  const head = `以下是 Jira 單號 ${ticket}${fetched.summary ? `「${fetched.summary}」` : ''}中屬於 ${date} 的留言（內文標示該日期，或內文未標日期但在當天建立；不是對話紀錄）。請依這些留言整理當天的工作子項，不要編造留言中沒有的內容。`;
   return { text: maskSecrets(`${head}\n\n${parts.join('\n\n')}`).text, count: parts.length };
 }

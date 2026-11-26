@@ -36,6 +36,103 @@ export function SweepButton() {
   );
 }
 
+interface JiraSyncDay {
+  date: string;
+  synced_at: string;
+  tickets: string[];
+  error: string | null;
+  failed?: { key: string; error: string }[];
+}
+
+/** 立即同步 Jira 活動（今天或指定日期） */
+export function JiraSyncButton({
+  date,
+  size,
+  variant,
+  retryFailed,
+  label,
+}: {
+  date?: string;
+  size?: 'sm' | 'md';
+  variant?: 'ghost';
+  /** 只重新讀取該日期先前失敗的單號 */
+  retryFailed?: boolean;
+  label?: string;
+}) {
+  const { track } = useJobs();
+  const toast = useToast();
+  const qc = useQueryClient();
+  const running = useRunningJob('jira-sync', 'jira-sync');
+  return (
+    <Button
+      size={size}
+      variant={variant}
+      icon={<RefreshCw className="size-4" />}
+      loading={!!running}
+      onClick={async () => {
+        try {
+          const r = await post<{ job_id: string }>('/api/jira-sync', { ...(date ? { date } : {}), ...(retryFailed ? { retry_failed: true } : {}) });
+          track(r.job_id, (j) => {
+            void qc.invalidateQueries({ queryKey: ['jira-sync'] });
+            if (j.status !== 'done') return;
+            const res = (j.result as { results?: { created: string[]; updated: string[]; appended: string[]; activities: number }[]; failed?: string[] })
+              ?.results?.[0];
+            if (!res) return;
+            const parts = [
+              res.created.length && `新增 ${res.created.length}`,
+              res.updated.length && `更新 ${res.updated.length}`,
+              res.appended.length && `附加到既有任務 ${res.appended.length}`,
+            ].filter(Boolean);
+            toast.show({ tone: 'success', message: `Jira 活動 ${res.activities} 張${parts.length ? `：${parts.join('、')}` : '，都已記錄'}` });
+          });
+        } catch (e) {
+          toast.show({ tone: 'error', message: (e as Error).message });
+        }
+      }}
+    >
+      {running ? (running.progress ?? '同步中…') : (label ?? '同步 Jira 活動')}
+    </Button>
+  );
+}
+
+/** 最近一次 Jira 活動同步失敗時提示 */
+function JiraSyncWarning() {
+  const q = useQuery({
+    queryKey: ['jira-sync'],
+    queryFn: () => get<{ enabled: boolean; days: JiraSyncDay[] }>('/api/jira-sync'),
+    refetchInterval: 5 * 60_000,
+  });
+  const days = (q.data?.enabled ? q.data.days : []).filter((d) => d.error || d.failed?.length).slice(0, 5);
+  if (!days.length) return null;
+  const md = (d: string) => d.slice(5).replace('-', '/');
+  return (
+    <Banner tone="warn" className="mb-4">
+      <div>Jira 活動同步有單號讀取失敗（不會自動重跑，需要時再按重試）：</div>
+      <ul className="mt-1 space-y-1">
+        {days.map((d) => (
+          <li key={d.date} className="flex flex-wrap items-center gap-x-2">
+            <b>{md(d.date)}</b>
+            {d.error ? (
+              <span>整次失敗：{d.error}</span>
+            ) : (
+              <span title={d.failed!.map((f) => `${f.key}：${f.error}`).join('\n')}>
+                {d.failed!.map((f) => f.key).join('、')}
+              </span>
+            )}
+            <JiraSyncButton
+              size="sm"
+              variant="ghost"
+              date={d.date}
+              retryFailed={!d.error}
+              label={d.error ? '重新同步' : `重試這 ${d.failed!.length} 張`}
+            />
+          </li>
+        ))}
+      </ul>
+    </Banner>
+  );
+}
+
 export function TodayPage() {
   const today = todayStr();
   const [openId, setOpenId] = useOpenTask();
@@ -63,7 +160,12 @@ export function TodayPage() {
             </>
           )
         }
-        actions={<NewTaskButton date={today} onCreated={(t) => setOpenId(t.id)} />}
+        actions={
+          <div className="flex items-center gap-2">
+            <JiraSyncButton variant="ghost" />
+            <NewTaskButton date={today} onCreated={(t) => setOpenId(t.id)} />
+          </div>
+        }
       />
 
       {pending > 0 && (
@@ -75,6 +177,7 @@ export function TodayPage() {
         </Banner>
       )}
       <TicketKeySuggestion />
+      <JiraSyncWarning />
 
       {tasks.isLoading ? (
         <div className="space-y-3">

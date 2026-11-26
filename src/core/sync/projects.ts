@@ -54,7 +54,8 @@ export function applyResolvedProject<T extends Task>(t: T, r: ProjectResult, isN
 
 /** 依目前規則重新判斷專案（父卡片查到後）；沒有變化時回傳 null */
 export function reresolveProject<T extends Task>(t: T, config: Config, cache: TicketCache): T | null {
-  if (t.manual || t.locked_fields.includes('project')) return null;
+  // 手動任務的專案是使用者填的；Jira 同步建立的任務則跟著單號規則自動判斷
+  if ((t.manual && t.source !== 'jira') || t.locked_fields.includes('project')) return null;
   const r = resolveProject({
     cwd: t.repo || undefined,
     ticket: t.ticket,

@@ -89,6 +89,26 @@ export const Config = z.object({
     })
     .prefault({}),
 
+  /** Jira 每日活動同步：把當天在 Jira 上動過、Claude Code 沒涵蓋到的單補成任務 */
+  jira_activity: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** 每日同步時間（今天）；過去的日期在服務啟動與排程時補抓 */
+      time: HHmm.default('18:00'),
+      /** 補抓最近幾天還沒在當天結束後同步過的日期 */
+      lookback_days: z.number().int().min(0).max(30).default(7),
+      skip_weekends: z.boolean().default(true),
+      /** 候選單號是否包含關注中的單 */
+      include_watched: z.boolean().default(true),
+      /** 這些欄位的變更不算「我的活動」 */
+      ignore_fields: z.array(z.string()).default(['Rank', 'Sprint']),
+      /** Jira 任務的預設時數 */
+      default_hours: z.number().min(0).max(24).default(0.5),
+      /** 子項用 summary.jira_prompt 範本請 Claude 整理；false 或失敗時用固定格式 */
+      ai_items: z.boolean().default(true),
+    })
+    .prefault({}),
+
   projects: z.array(ProjectRuleInput).default([]).transform(assignProjectIds),
 
   report: z

@@ -63,7 +63,8 @@ import {
   writeTalk,
   type TalkRecord,
 } from '../core/talk/index.js';
-import { generateReport, generateTalk, jiraSummarizeTask, previewOutput, refreshTicketInfo, summarizeTask, summaryPromptFor } from './actions.js';
+import { generateReport, generateTalk, jiraSummarizeTask, previewOutput, refreshTicketInfo, summarizeTask, summaryPromptFor, syncJiraActivity, type JiraSyncResult } from './actions.js';
+import { datesNeedingSync, readSyncState } from '../core/jira-activity/index.js';
 import { TaskIndex, type ChangeEvent } from './index-cache.js';
 import { JobManager, type Job } from './jobs.js';
 
@@ -468,6 +469,31 @@ export function createDaemon(opts: DaemonOptions) {
     return summaryPromptFor(paths, cfg().config, t);
   });
 
+  // ───────────── Jira 每日活動同步
+  app.get('/api/jira-sync', async () => {
+    const s = readSyncState(paths);
+    const days = Object.entries(s.days)
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .slice(0, 14)
+      .map(([date, d]) => ({ date, ...d }));
+    const running = jobs.findRunning('jira-sync', 'jira-sync');
+    return { enabled: cfg().config.jira_activity.enabled, days, running: running ? running.id : null };
+  });
+  app.post('/api/jira-sync', async (req) => {
+    const b = body(
+      z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(), retry_failed: z.boolean().optional() }),
+      req,
+    );
+    const date = b.date ?? today();
+    if (b.retry_failed) {
+      const keys = (readSyncState(paths).days[date]?.failed ?? []).map((f) => f.key);
+      if (!keys.length) throw new HttpError(400, `${date} 沒有讀取失敗的單號`);
+      return { job_id: startJiraSync([date], '重試失敗單號', keys).id };
+    }
+    const job = startJiraSync([date], '手動');
+    return { job_id: job.id };
+  });
+
   app.post('/api/sweep', async () => {
     const running = jobs.findRunning('sweep', 'sweep');
     if (running) return { job_id: running.id };
@@ -854,6 +880,51 @@ export function createDaemon(opts: DaemonOptions) {
     });
   };
 
+  // ───────────── Jira 每日活動同步（排程與補抓）
+  let lastJiraCheck = 0;
+  const startJiraSync = (dates: string[], reason: string, onlyKeys?: string[]): Job => {
+    const running = jobs.findRunning('jira-sync', 'jira-sync');
+    if (running) return running;
+    return jobs.start('jira-sync', 'jira-sync', async (ctx) => {
+      const results: JiraSyncResult[] = [];
+      const failed: string[] = [];
+      for (const date of dates) {
+        if (ctx.signal.aborted) break;
+        try {
+          const r = await syncJiraActivity(paths, cfg().config, date, ctx, { onlyKeys });
+          results.push(r);
+          const changed = r.created.length + r.updated.length + r.appended.length + r.removed.length;
+          writeLog(
+            paths,
+            'daemon',
+            r.errors.length ? 'warn' : 'info',
+            `Jira 活動同步（${reason}）${date}：活動 ${r.activities}、新增 ${r.created.length}、更新 ${r.updated.length}、附加 ${r.appended.length}、移除 ${r.removed.length}` +
+              (r.errors.length ? `；${r.errors.join('；')}` : ''),
+          );
+          if (changed) {
+            index.load();
+            broadcast('change', { kind: 'task', action: 'change', path: paths.tasks } satisfies ChangeEvent);
+            await rebalanceDates([date]);
+          }
+        } catch (e) {
+          if (ctx.signal.aborted) break;
+          failed.push(`${date}：${(e as Error).message.slice(0, 200)}`);
+          writeLog(paths, 'daemon', 'warn', `Jira 活動同步（${reason}）${date} 失敗：${(e as Error).message.slice(0, 300)}`);
+        }
+      }
+      if (failed.length && !results.length) throw new Error(failed.join('；'));
+      return { results, failed };
+    });
+  };
+  const runScheduledJiraSync = (reason: string) => {
+    lastJiraCheck = Date.now();
+    if (jobs.findRunning('jira-sync', 'jira-sync') || jobs.findRunning('sweep', 'sweep')) return;
+    const { config, error } = cfg();
+    if (error) return;
+    const dates = datesNeedingSync({ state: readSyncState(paths), now: Date.now(), tz: config.time.timezone, config });
+    if (dates.length) startJiraSync(dates, reason);
+  };
+
   // ───────────── 父卡片查詢（單號資訊快取）
   /** 近期任務的單號才查詢，避免一次查太多 */
   const TICKET_LOOKBACK_DAYS = 60;
@@ -930,6 +1001,7 @@ export function createDaemon(opts: DaemonOptions) {
             runScheduledSweep('每日排程');
           }
           if (Date.now() - lastTicketRefresh >= 10 * 60_000 && !jobs.findRunning('sweep', 'sweep')) startTicketRefresh('排程');
+          if (Date.now() - lastJiraCheck >= 60_000) runScheduledJiraSync('排程');
         }, 30_000);
         // 啟動當天若已過排程時間，不再重複（啟動時已掃描）
         const { config } = cfg();

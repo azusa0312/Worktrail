@@ -8,7 +8,7 @@ import { ApiError, get, post, put, type PromptInfo } from '../lib/api';
 import { applyTheme, useDebounced, useRunningJob, useToast } from '../lib/app';
 import { Banner, Button, Card, Confirm, cx, Field, IconButton, Input, Modal, PageHeader, Select, Skeleton, Tag } from '../components/ui';
 import { Link } from 'react-router-dom';
-import { SweepButton } from './Today';
+import { JiraSyncButton, SweepButton } from './Today';
 
 type Cfg = any;
 
@@ -241,7 +241,7 @@ export function SettingsPage() {
           </details>
         </Section>
 
-        <JiraSection cfg={cfg} set={set} bind={bind} />
+        <JiraSection cfg={cfg} set={set} bind={bind} num={num} />
 
         <Section id="projects" title="專案">
           <div>
@@ -689,7 +689,17 @@ function ReportSection({ cfg, set, bind }: { cfg: Cfg; set: (p: string, v: unkno
 }
 
 /** Jira 相關設定集中在一起：專案代碼、依大型工作建立專案、從 Jira 整理的範本與 MCP */
-function JiraSection({ cfg, set, bind }: { cfg: Cfg; set: (p: string, v: unknown) => void; bind: (p: string) => object }) {
+function JiraSection({
+  cfg,
+  set,
+  bind,
+  num,
+}: {
+  cfg: Cfg;
+  set: (p: string, v: unknown) => void;
+  bind: (p: string) => object;
+  num: (p: string) => object;
+}) {
   const prompts = useQuery({ queryKey: ['prompts'], queryFn: () => get<{ prompts: PromptInfo[] }>('/api/prompts') });
   const summaryPrompts = (prompts.data?.prompts ?? []).filter((p) => p.type === 'summary');
   return (
@@ -706,6 +716,39 @@ function JiraSection({ cfg, set, bind }: { cfg: Cfg; set: (p: string, v: unknown
           }}
         />
       </Row>
+      <Row label="每日活動同步" hint="每天抓你在 Jira 上動過的單（建立、移動狀態、留言、編輯），沒用 Claude 處理的單自動補成任務；同單號已有任務時，活動附加到它的補充說明">
+        <div className="flex flex-wrap items-center gap-2">
+          <Toggle checked={cfg.jira_activity?.enabled !== false} onChange={(v) => set('jira_activity.enabled', v)} />
+          <JiraSyncButton size="sm" variant="ghost" />
+        </div>
+      </Row>
+      {cfg.jira_activity?.enabled !== false && (
+        <>
+          <Row label="同步時間" hint="每天這個時間同步今天；服務啟動時也會補抓最近幾天還沒同步完整的日期">
+            <div className="flex flex-wrap items-center gap-2">
+              <Input type="time" {...bind('jira_activity.time')} />
+              <span className="text-xs text-ink-3">補抓</span>
+              <Input className="w-20" min={0} max={30} {...num('jira_activity.lookback_days')} />
+              <span className="text-xs text-ink-3">天</span>
+            </div>
+          </Row>
+          <Row label="Jira 任務預設時數" hint="自動建立的 Jira 任務時數，之後可在任務上修改">
+            <Input className="w-24" min={0} max={24} step={0.5} {...num('jira_activity.default_hours')} />
+          </Row>
+          <Row label="略過週末" hint="週六、週日不同步">
+            <Toggle checked={cfg.jira_activity?.skip_weekends !== false} onChange={(v) => set('jira_activity.skip_weekends', v)} />
+          </Row>
+          <Row label="包含關注中的單" hint="候選單號也包含你關注（watch）的單；仍只計算你自己的操作">
+            <Toggle checked={cfg.jira_activity?.include_watched !== false} onChange={(v) => set('jira_activity.include_watched', v)} />
+          </Row>
+          <Row label="子項由 Claude 整理" hint="開啟時用「從 Jira 整理的範本」整理子項；關閉或失敗時用固定格式（狀態變更、留言第一行）">
+            <Toggle checked={cfg.jira_activity?.ai_items !== false} onChange={(v) => set('jira_activity.ai_items', v)} />
+          </Row>
+          <Row label="忽略的欄位" hint="這些欄位的變更不算你的活動（例如排序 Rank、Sprint）">
+            <ListEditor values={cfg.jira_activity?.ignore_fields ?? []} onChange={(v) => set('jira_activity.ignore_fields', v)} placeholder="Rank" />
+          </Row>
+        </>
+      )}
       <Row label="從 Jira 整理的範本" hint="手動任務按「從 Jira 整理」時，用來把當天留言整理成子項的範本">
         <Select {...bind('summary.jira_prompt')}>
           {summaryPrompts.map((p) => (

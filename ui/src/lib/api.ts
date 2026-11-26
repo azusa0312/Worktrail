@@ -101,6 +101,8 @@ export interface Task {
   body: string;
   /** 手動新增（不在 Claude Code 中進行的工作） */
   manual?: boolean;
+  /** jira＝由 Jira 每日活動同步自動建立 */
+  source?: 'jira';
   /** 已合併：同一天、同專案、帶此標記的任務顯示為一筆 */
   merged?: boolean;
   path: string;

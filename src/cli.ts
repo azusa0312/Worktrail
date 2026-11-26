@@ -100,6 +100,54 @@ program
   });
 
 program
+  .command('jira-sync')
+  .description('同步某一天的 Jira 活動（預設今天），補上沒用 Claude 處理的單')
+  .option('--date <YYYY-MM-DD>', '要同步的日期')
+  .option('--failed', '只列出讀取失敗的單號（不執行同步）')
+  .option('--retry-failed', '只重新讀取該日期先前失敗的單號')
+  .action(async (opts: { date?: string; failed?: boolean; retryFailed?: boolean }) => {
+    const { storageRoot, StoragePaths } = await import('./core/storage/paths.js');
+    const { loadConfig } = await import('./core/storage/config-store.js');
+    const { localDate } = await import('./core/capture/tz.js');
+    const { readSyncState } = await import('./core/jira-activity/index.js');
+    const root = storageRoot();
+    if (!root) throw new Error('尚未安裝：請先執行 worktrail install');
+    const paths = new StoragePaths(root);
+    const config = loadConfig(paths).config;
+    const state = readSyncState(paths);
+    if (opts.failed) {
+      const days = Object.entries(state.days)
+        .filter(([d, s]) => (!opts.date || d === opts.date) && (s.failed.length || s.error))
+        .sort((a, b) => a[0].localeCompare(b[0]));
+      if (!days.length) console.log('沒有讀取失敗的單號');
+      for (const [d, s] of days) {
+        if (s.error) console.log(`${d}：整次同步失敗（${s.error}）`);
+        for (const f of s.failed) console.log(`${d}  ${f.key.padEnd(10)}  ${f.error}`);
+      }
+      return;
+    }
+    const { syncJiraActivity } = await import('./daemon/actions.js');
+    const date = opts.date ?? localDate(Date.now(), config.time.timezone);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('日期格式須為 YYYY-MM-DD');
+    let onlyKeys: string[] | undefined;
+    if (opts.retryFailed) {
+      onlyKeys = (state.days[date]?.failed ?? []).map((f) => f.key);
+      if (!onlyKeys.length) return console.log(`${date} 沒有讀取失敗的單號`);
+      console.log(`重新讀取：${onlyKeys.join('、')}`);
+    }
+    const ctx = { signal: new AbortController().signal, progress: (m: string) => console.log(m) };
+    const r = await syncJiraActivity(paths, config, date, ctx, { onlyKeys });
+    console.log(
+      `${date}：活動 ${r.activities} 張，新增 ${r.created.length}、更新 ${r.updated.length}、附加 ${r.appended.length}、移除 ${r.removed.length}`,
+    );
+    for (const [label, list] of [['新增', r.created], ['更新', r.updated], ['附加到既有任務', r.appended], ['略過', r.skipped]] as const) {
+      if (list.length) console.log(`  ${label}：${list.join('、')}`);
+    }
+    for (const e of r.errors) console.error(`  ⚠ ${e}`);
+    console.log('（常駐服務執行中時，UI 會在下次重新整理後顯示）');
+  });
+
+program
   .command('hook', { hidden: true })
   .description('給 Claude Code hook 呼叫的進入點（使用者不需直接執行）')
   .argument('<event>', 'session-start | stop | session-end')

@@ -35,6 +35,16 @@ time:
 ticket:
   keys: [TDDA]                  # 接受的 Jira 專案代碼
 
+jira_activity:                  # Jira 每日活動同步：補上沒用 Claude 處理的單
+  enabled: true
+  time: "18:00"                 # 每日同步今天的時間
+  lookback_days: 7              # 補抓最近幾天
+  skip_weekends: true
+  include_watched: true         # 候選單號包含關注中的單
+  ignore_fields: [Rank, Sprint] # 這些欄位的變更不算我的活動
+  default_hours: 0.5            # Jira 任務預設時數
+  ai_items: true                # 子項由 Claude 整理；false 用固定格式
+
 projects: []
 #  - name: 社交工程
 #    match:

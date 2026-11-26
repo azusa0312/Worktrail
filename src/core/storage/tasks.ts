@@ -18,7 +18,7 @@ const KEY_ORDER = [
   'schema', 'id', 'session_id', 'date', 'project', 'project_id', 'project_unmapped', 'ticket', 'related_tickets', 'title',
   'title_source', 'repo', 'branch', 'first_activity', 'last_activity', 'active_minutes', 'hours', 'hours_overridden',
   'hours_source', 'hours_estimate', 'locked_fields', 'commits', 'summary_status', 'summary_updated_at', 'summary_prompt',
-  'summary_prompt_hash', 'manual', 'merged', 'items',
+  'summary_prompt_hash', 'manual', 'source', 'jira_sync', 'merged', 'items',
 ];
 
 export function serializeTask(task: Task): string {

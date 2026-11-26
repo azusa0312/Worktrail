@@ -81,6 +81,7 @@
 - 維持「Worktrail 不直接呼叫 Jira API」（規格 1.3）：由 `claude -p` 透過使用者已連線的 Jira MCP 讀取，只以 `--allowedTools` 開放唯讀的 `getAccessibleAtlassianResources`、`getJiraIssue`。MCP 名稱為設定 `claude_cli.jira_mcp_server`（預設 `atlassian-rovo-mcp`）。
 - 分兩次呼叫：第一次只取回標題與留言原文（JSON）；日期過濾在 `src/core/summary/jira.ts` 以程式處理（可測試、不靠模型判斷）；第二次套用摘要範本（`summary.default_prompt`）產生子項，與補寫摘要同一套格式與「前次未完成項目」。
 - 日期依**留言內文**而非留言建立時間：留言第一個非空行以日期開頭，或某行只有日期（可帶星期、冒號、粗體／標題標記），即開始一段，直到下一個日期行。支援 `2026/11/16`、`2026-11-16`、`2026.11.16`、`2026年11月16日`、省略年份的 `11/16`（年份取任務日期）。第一個日期行之前的文字不屬於任何日期。不過濾留言者。
+  - （2026-11-25 補充）內文**完全沒有日期行**的留言（例如他人留的「已部署至測試台，麻煩測試」、自己留的「test pass」），改依留言建立時間判斷：建立時間換算成 `time.timezone` 的日期等於任務日期時，整則留言納入。內文有日期行的留言仍只看內文日期，不受建立時間影響（避免「一則留言累積多天」被整則算進建立當天）。Jira 的時間格式 `+0800`（無冒號）先補成 `+08:00` 再解析。
 - 任務已有子項時 API 回 409（`needs_overwrite`），UI 確認後整批取代子項（補充說明可能一併更新）。時數、專案、單號仍維持使用者輸入；標題只在使用者填的就是單號本身時換成 Jira 標題。
 - API：`POST /api/tasks/:id/jira-summarize`（`overwrite`），工作類型 `jira-summarize`。只接受有單號的手動任務。
 
@@ -356,3 +357,16 @@
 - 每一步按「下一步」就以服務端最新設定為底、只寫入該步負責的欄位，中途關掉不會遺失，也不會蓋掉背景自動建立的專案。主題與風格點選即套用到畫面，完成或「稍後再設定」時一併存檔。
 - 設定 → 一般 →「重新執行引導」開啟 `/welcome`，不改 `ui.onboarding`。
 - 示範資料（`scripts/demo/seed.mts`）設為 `done`，錄 GIF 時不會停在引導頁。
+
+## Jira 每日活動同步（2026-11-25 新增，規格未涵蓋）
+
+- 起因：只從 Claude Code 對話擷取任務，沒用 Claude 處理的單（手動測試後留言 test pass、移動狀態）會漏記。參考使用者既有的「QA 日報」排程（JQL 找候選＋看 changelog 作者確認是本人）。計畫書見 `docs/計畫-Jira每日活動同步.md`。
+- 抓取（`claude -p`，只回原始 JSON）：第一次以 `atlassianUserInfo` 取 accountId，並用兩個 JQL 找候選單號（我建立／指派給我／關注中／當天我改過狀態，且 `updated >= 當天`；限定 `ticket.keys` 的專案）與當天我建立的單；第二次起每 8 張單呼叫 `getJiraIssue`（comment＋changelog）。JQL 用絕對日期字串。
+- 判斷在 `src/core/jira-activity/` 以程式處理：只留作者是我、建立時間換算 `time.timezone` 後是當天的留言與變更；`ignore_fields`（預設 Rank、Sprint）不算。`updated` 時間不可信（同事整批調整排序也會更新）。
+- 合併：同單號（含 `related_tickets`）已有 Claude 或手動任務時，不另建任務，把活動寫進該任務補充說明的 `<!-- worktrail:jira-activity -->` 區塊（重跑時取代，不動使用者其他內容）；否則建立 Jira 任務：`manual: true`、`source: jira`、session_id 為 `sha1(jira|日期|單號)`（同一天同單號固定一筆）、時數 `jira_activity.default_hours`（使用者指定 0.5，`hours_source: user`，不參與每日工時縮減）、專案依單號規則判斷（`reresolveProject` 對 Jira 任務不跳過）。
+- 子項預設以 `summary.jira_prompt` 範本請 Claude 整理，失敗或關閉 `ai_items` 時用固定格式（狀態 A → B、留言第一行、更新欄位）。
+- 使用者修改的保護：`jira_sync.content_hash` 記錄自動產生時的標題＋子項＋時數；之後不一致即視為改過，不再覆蓋。`events_hash` 沒變就不重新整理。Claude 任務後來才出現時，未改過的 Jira 任務移到垃圾桶並改為附加。使用者刪除的 Jira 任務：`jira-sync.json` 的 `created` 記錄過、檔案不在了，就不再建立。
+- 排程：`jira_activity.time`（預設 18:00）同步今天；過去 `lookback_days`（預設 7）天內、尚未在「那天結束之後」成功同步的工作日也會補抓（當天 18:00 之後的工作隔天補上）。失敗一小時後重試；任何失敗只記錄並在今日頁顯示警告，不寫入佔位資料（QA 日報曾因 JQL 工具壞掉靜默漏了一週）。
+- 2026-11-25 修訂（重試會耗用大量 token）：原本只要有一張單讀取失敗，整天就標記失敗、每小時重讀全部單號。改為：
+  - 部分單號讀取失敗：記在 `jira-sync.json` 的 `failed`（單號＋原因），那天視為已同步，**不自動重試**。今日頁列出失敗單號，按「重試這 N 張」只重新讀取那幾張（CLI：`jira-sync --failed` 列出、`--retry-failed` 重試）。重試時附加到既有任務的附註只更新該單的段落。
+  - 整次失敗（例如 JQL 查詢失敗）：一小時後自動重試，總共最多 2 次（`attempts`），之後只顯示警告。

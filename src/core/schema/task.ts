@@ -78,6 +78,10 @@ export const TaskFrontmatter = z.object({
   summary_prompt_hash: z.string().optional(),
   /** 使用者手動新增（不在 Claude Code 中進行的工作），沒有對話紀錄，擷取程式不會碰它 */
   manual: z.boolean().optional(),
+  /** 任務來源：jira＝由「Jira 每日活動同步」自動建立（同時是 manual） */
+  source: z.enum(['jira']).optional(),
+  /** Jira 同步的指紋：events_hash 判斷活動有沒有變化，content_hash 判斷使用者有沒有改過 */
+  jira_sync: z.object({ events_hash: z.string(), content_hash: z.string() }).optional(),
   /** 已合併：同一天、同專案、帶此標記的任務在清單與報告中視為一筆（見 sync/task-merge.ts） */
   merged: z.boolean().optional(),
   // 擷取欄位

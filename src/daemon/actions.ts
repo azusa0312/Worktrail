@@ -12,11 +12,43 @@ import type { StoragePaths } from '../core/storage/paths.js';
 import type { TaskRecord } from '../core/storage/tasks.js';
 import { applySummary, buildSummaryGuide, condenseTranscript, SummaryInput } from '../core/summary/index.js';
 import { buildJiraFetchPrompt, formatJiraContent, jiraAllowedTools, JiraFetchResult } from '../core/summary/jira.js';
+import { maskSecrets } from '../core/summary/index.js';
+import {
+  activityContent,
+  activityNote,
+  buildCandidatesPrompt,
+  buildIssuesPrompt,
+  CandidatesOutput,
+  candidatesAllowedTools,
+  collectActivities,
+  fallbackItems,
+  isUserEdited,
+  ISSUE_BATCH,
+  IssuesOutput,
+  issuesAllowedTools,
+  type IssuesOutput as IssuesOutputData,
+  keysToFetch,
+  mergeNote,
+  upsertNoteTickets,
+  newJiraTask,
+  planJiraSync,
+  readSyncState,
+  updateSyncState,
+  withJiraItems,
+  type JiraActivity,
+  type JiraIssueData,
+} from '../core/jira-activity/index.js';
+import { resolveProject } from '../core/capture/project.js';
+import type { Item, Task } from '../core/schema/task.js';
+import { withLock } from '../core/storage/fsutil.js';
+import { listTasks, readTask, taskLockKey, trashTask, writeTask } from '../core/storage/tasks.js';
+import { applyResolvedProject } from '../core/sync/projects.js';
 import { findTranscriptPath } from '../core/sync/locate.js';
 import { prepareTalk, saveGeneratedTalk } from '../core/talk/index.js';
 import {
   buildTicketInfoPrompt,
   parseTicketInfoOutput,
+  readTicketCache,
   ticketInfoAllowedTools,
   updateTicketCache,
   type TicketInfo,
@@ -88,7 +120,7 @@ export async function summarizeTask(
   return { task_id: r.task.id, items: r.task.items.length, warnings: r.warnings };
 }
 
-/** 手動任務「從 Jira 整理」：claude -p 經 Jira MCP 讀留言 → 依內文日期過濾 → 套摘要範本產生子項 */
+/** 手動任務「從 Jira 整理」：claude -p 經 Jira MCP 讀留言 → 依內文日期（未標日期則依建立時間）過濾 → 套摘要範本產生子項 */
 export async function jiraSummarizeTask(
   paths: StoragePaths,
   config: Config,
@@ -115,9 +147,9 @@ export async function jiraSummarizeTask(
   }
   if (json && typeof json === 'object' && 'error' in json) throw new Error(`讀取 Jira 失敗：${String((json as { error: unknown }).error)}`);
   const fetched = JiraFetchResult.parse(json);
-  const content = formatJiraContent(task.ticket, fetched, task.date);
+  const content = formatJiraContent(task.ticket, fetched, task.date, config.time.timezone);
   if (!content) {
-    throw new Error(`${task.ticket} 共 ${fetched.comments.length} 則留言，沒有內文標示 ${task.date.replaceAll('-', '/')} 的留言`);
+    throw new Error(`${task.ticket} 共 ${fetched.comments.length} 則留言，沒有內文標示或在 ${task.date.replaceAll('-', '/')} 建立的留言`);
   }
   ctx.progress(`整理 ${content.count} 段留言…`);
   const g = buildSummaryGuide({
@@ -266,4 +298,234 @@ export async function previewOutput(config: Config, paths: StoragePaths, prompt:
     onProgress: (n) => ctx.progress(`Claude 撰寫中…（${n} 字）`),
   });
   return { output };
+}
+
+// ───────────── Jira 每日活動同步
+
+export interface JiraSyncResult {
+  date: string;
+  activities: number;
+  created: string[];
+  updated: string[];
+  appended: string[];
+  removed: string[];
+  skipped: string[];
+  errors: string[];
+}
+
+/** 以 summary.jira_prompt 範本請 Claude 整理子項；失敗時丟出錯誤（由呼叫端退回固定格式） */
+async function aiItemsFor(
+  paths: StoragePaths,
+  config: Config,
+  claude: string,
+  task: Task,
+  content: string,
+  ctx: JobContext,
+): Promise<Item[]> {
+  const g = buildSummaryGuide({
+    paths,
+    config,
+    task,
+    mode: 'json',
+    prompt: config.summary.jira_prompt,
+    transcript: content,
+    today: localDate(Date.now(), config.time.timezone),
+  });
+  const out = await runClaudePrint({ claudePath: claude, prompt: g.guide, cwd: paths.claudeRuns, signal: ctx.signal, timeoutMs: 5 * 60_000 });
+  const input = SummaryInput.parse(extractJson(out));
+  return input.items;
+}
+
+/**
+ * 同步某一天的 Jira 活動：claude -p 讀取 → 程式過濾 → 新增／更新 Jira 任務，或附加到同單號的既有任務。
+ * 讀取失敗時只記錄錯誤，不寫入任何佔位資料。
+ */
+/**
+ * 同步某一天的 Jira 活動。
+ * onlyKeys：只重新讀取這幾張單（重試先前讀取失敗的單），其他單的紀錄維持不動。
+ */
+export async function syncJiraActivity(
+  paths: StoragePaths,
+  config: Config,
+  date: string,
+  ctx: JobContext,
+  opts: { onlyKeys?: readonly string[] } = {},
+): Promise<JiraSyncResult> {
+  const tz = config.time.timezone;
+  const ja = config.jira_activity;
+  const result: JiraSyncResult = { date, activities: 0, created: [], updated: [], appended: [], removed: [], skipped: [], errors: [] };
+  const recordFailure = async (msg: string) =>
+    updateSyncState(paths, (s) => {
+      const prev = s.days[date];
+      s.days[date] = {
+        synced_at: new Date().toISOString(),
+        tickets: prev?.tickets ?? [],
+        created: prev?.created ?? [],
+        error: msg.slice(0, 300),
+        failed: prev?.failed ?? [],
+        attempts: (prev?.attempts ?? 0) + 1,
+      };
+    });
+  try {
+    const claude = await claudePath(config);
+    const server = config.claude_cli.jira_mcp_server || 'atlassian-rovo-mcp';
+
+    ctx.progress(`查詢 ${date} 的 Jira 活動…`);
+    const raw = await runClaudePrint({
+      claudePath: claude,
+      prompt: buildCandidatesPrompt(date, server, config.ticket.keys, ja.include_watched),
+      cwd: paths.claudeRuns,
+      signal: ctx.signal,
+      timeoutMs: 5 * 60_000,
+      extraArgs: ['--allowedTools', ...candidatesAllowedTools(server)],
+    });
+    const json = extractJson(raw);
+    if (json && typeof json === 'object' && 'error' in json && !('account_id' in json)) {
+      throw new Error(`查詢 Jira 失敗：${String((json as { error: unknown }).error)}`);
+    }
+    const candidates = CandidatesOutput.parse(json);
+    const only = opts.onlyKeys ? new Set(opts.onlyKeys.map((k) => k.trim().toUpperCase())) : null;
+    const keys = only ? [...only] : keysToFetch(candidates);
+
+    const issues: JiraIssueData[] = [];
+    const failed = new Map<string, string>();
+    for (let i = 0; i < keys.length; i += ISSUE_BATCH) {
+      if (ctx.signal.aborted) throw new Error('已取消');
+      const batch = keys.slice(i, i + ISSUE_BATCH);
+      ctx.progress(`讀取單號 ${Math.min(i + batch.length, keys.length)}/${keys.length}…`);
+      try {
+        // 偶爾模型沒有照格式輸出：重試一次
+        let parsed: IssuesOutputData | undefined;
+        for (let attempt = 1; !parsed; attempt++) {
+          try {
+            const out = await runClaudePrint({
+              claudePath: claude,
+              prompt: buildIssuesPrompt(batch, date, server, candidates.account_id),
+              cwd: paths.claudeRuns,
+              signal: ctx.signal,
+              timeoutMs: 8 * 60_000,
+              extraArgs: ['--allowedTools', ...issuesAllowedTools(server)],
+            });
+            parsed = IssuesOutput.parse(extractJson(out));
+          } catch (e) {
+            if (attempt >= 2 || ctx.signal.aborted) throw e;
+          }
+        }
+        issues.push(...parsed.issues);
+        for (const e of parsed.errors) {
+          result.errors.push(`${e.key}：${e.error}`);
+          failed.set(e.key.trim().toUpperCase(), e.error.slice(0, 200));
+        }
+      } catch (e) {
+        if (ctx.signal.aborted) throw e;
+        const msg = (e as Error).message.slice(0, 200);
+        result.errors.push(`${batch.join(', ')}：${msg}`);
+        for (const k of batch) failed.set(k, msg);
+      }
+    }
+
+    const all = collectActivities({ candidates, issues, date, tz, ignoreFields: ja.ignore_fields });
+    const activities = only ? all.filter((a) => only.has(a.ticket)) : all;
+    result.activities = activities.length;
+    const state = readSyncState(paths);
+    const tasks = listTasks(paths, date, date);
+    const plan = planJiraSync({
+      date,
+      activities,
+      tasks,
+      previouslyCreated: state.days[date]?.created ?? [],
+      dismissed: state.dismissed,
+    });
+
+    const cache = readTicketCache(paths);
+    const makeItems = async (t: Task, a: JiraActivity): Promise<Item[]> => {
+      const fallback = fallbackItems(a);
+      if (!ja.ai_items) return fallback.length ? fallback : [{ text: `處理 ${a.ticket}`, status: 'done' }];
+      try {
+        ctx.progress(`整理 ${a.ticket} 的子項…`);
+        return await aiItemsFor(paths, config, claude, t, activityContent(a, date, tz), ctx);
+      } catch (e) {
+        if (ctx.signal.aborted) throw e;
+        result.errors.push(`${a.ticket} 子項整理失敗，改用固定格式：${(e as Error).message.slice(0, 120)}`);
+        return fallback.length ? fallback : [{ text: `處理 ${a.ticket}`, status: 'done' }];
+      }
+    };
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+
+    for (const action of plan) {
+      if (ctx.signal.aborted) throw new Error('已取消');
+      switch (action.kind) {
+        case 'create': {
+          const a = action.activity;
+          let t = newJiraTask(a, date, config);
+          const r = resolveProject({ cwd: undefined, ticket: a.ticket, rules: config.projects, ticketInfo: cache[a.ticket] });
+          if (!r.unmapped) t = applyResolvedProject(t, r, true);
+          t = withJiraItems(t, a, await makeItems(t, a), tz);
+          await withLock(taskLockKey(paths, date, t.session_id), () => writeTask(paths, t));
+          result.created.push(a.ticket);
+          break;
+        }
+        case 'update': {
+          const a = action.activity;
+          const cur = byId.get(action.taskId);
+          if (!cur) break;
+          const items = await makeItems(cur, a);
+          await withLock(taskLockKey(paths, date, cur.session_id), () => {
+            const latest = readTask(cur.path);
+            // 讀取到寫入之間被使用者改過：不覆蓋
+            if (!latest || isUserEdited(latest)) return;
+            const next = withJiraItems({ ...latest, title: maskSecrets(a.summary || latest.title).text }, a, items, tz);
+            writeTask(paths, next, latest.path);
+            result.updated.push(a.ticket);
+          });
+          break;
+        }
+        case 'append': {
+          const cur = byId.get(action.taskId);
+          if (!cur) break;
+          await withLock(taskLockKey(paths, date, cur.session_id), () => {
+            const latest = readTask(cur.path);
+            if (!latest) return;
+            const body = only
+              ? upsertNoteTickets(latest.body, action.activities, tz)
+              : mergeNote(latest.body, activityNote(action.activities, tz));
+            if (body === latest.body) return;
+            writeTask(paths, { ...latest, body }, latest.path);
+            result.appended.push(...action.activities.map((a) => a.ticket));
+          });
+          break;
+        }
+        case 'remove': {
+          const cur = byId.get(action.taskId);
+          if (!cur) break;
+          trashTask(paths, cur);
+          result.removed.push(cur.ticket ?? cur.id);
+          break;
+        }
+        case 'skip':
+          result.skipped.push(`${action.ticket}（${{ edited: '已手動修改', unchanged: '沒有變化', dismissed: '已刪除過' }[action.reason]}）`);
+          break;
+      }
+    }
+
+    await updateSyncState(paths, (s) => {
+      const prev = s.days[date];
+      const found = activities.map((a) => a.ticket);
+      // 重試部分單號：保留其他單的紀錄，只更新這次重試的單
+      const prevFailed = (prev?.failed ?? []).filter((f) => !only || !only.has(f.key));
+      s.days[date] = {
+        synced_at: only && prev ? prev.synced_at : new Date().toISOString(),
+        tickets: only ? [...new Set([...(prev?.tickets ?? []), ...found])] : found,
+        created: [...new Set([...(prev?.created ?? []), ...result.created])],
+        // 讀取失敗的單只列出、不自動重試（避免整天重讀耗用大量 token）
+        error: null,
+        failed: [...prevFailed, ...[...failed].map(([key, error]) => ({ key, error }))],
+        attempts: 0,
+      };
+    });
+    return result;
+  } catch (e) {
+    if (!ctx.signal.aborted) await recordFailure((e as Error).message);
+    throw e;
+  }
 }

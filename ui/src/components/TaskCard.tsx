@@ -201,7 +201,7 @@ export function TaskCard({ task, onOpen, selected, actions }: { task: Task; onOp
     >
       <div className="flex flex-wrap items-center gap-2 text-xs">
         <ProjectTag name={task.project} />
-        {task.manual && <Tag title="不在 Claude Code 中進行的工作">手動</Tag>}
+        {task.source === 'jira' ? <Tag title="由 Jira 每日活動同步自動建立">Jira</Tag> : task.manual && <Tag title="不在 Claude Code 中進行的工作">手動</Tag>}
         <SummaryStatusTag status={task.summary_status} />
         <span className="ml-auto flex items-center gap-3">
           {task.commits.length > 0 && (

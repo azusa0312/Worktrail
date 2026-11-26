@@ -159,7 +159,7 @@ export function MergedGroupCard({ entry, onOpen, selected }: { entry: Extract<Ta
                 <TicketColumn ticket={t.ticket} />
                 <span className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                   <span className="wt-task-title text-base font-semibold leading-snug">{displayTitle(t) || <span className="text-ink-3">（無標題）</span>}</span>
-                  {t.manual && <Tag title="不在 Claude Code 中進行的工作">手動</Tag>}
+                  {t.source === 'jira' ? <Tag title="由 Jira 每日活動同步自動建立">Jira</Tag> : t.manual && <Tag title="不在 Claude Code 中進行的工作">手動</Tag>}
                   <SummaryStatusTag status={t.summary_status} />
                 </span>
                 <span className="flex shrink-0 items-center gap-1 pt-[3px]">

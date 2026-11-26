@@ -5,7 +5,14 @@ import { listPrompts, loadPrompt, validatePrompt } from '../src/core/prompt/inde
 import { Config } from '../src/core/schema/config.js';
 import type { Task } from '../src/core/schema/task.js';
 import { buildSummaryGuide } from '../src/core/summary/index.js';
-import { formatJiraContent, jiraAllowedTools, leadingDate, sectionsForDate } from '../src/core/summary/jira.js';
+import {
+  commentSectionsForDate,
+  createdLocalDate,
+  formatJiraContent,
+  jiraAllowedTools,
+  leadingDate,
+  sectionsForDate,
+} from '../src/core/summary/jira.js';
 import { emptyTask } from '../src/core/sync/merge.js';
 import { makeEnv, type TestEnv } from './env.js';
 
@@ -64,6 +71,8 @@ describe('sectionsForDate', () => {
   });
 });
 
+const TZ = 'Asia/Taipei';
+
 describe('formatJiraContent', () => {
   it('組出內容並遮蔽密鑰；沒有符合的留言回傳 null', () => {
     const fetched = {
@@ -73,13 +82,48 @@ describe('formatJiraContent', () => {
         { author: 'SRE', created: '2026-11-16T10:00:00.000+0800', body: '2026/11/15\n* 開防火牆' },
       ],
     };
-    const r = formatJiraContent('TDDA-1971', fetched, '2026-11-16');
+    const r = formatJiraContent('TDDA-1971', fetched, '2026-11-16', TZ);
     expect(r?.count).toBe(1);
     expect(r?.text).toContain('TDDA-1971「[源碼檢測] Fortify」');
     expect(r?.text).toContain('### Leo 的留言');
     expect(r?.text).not.toContain('abc123');
     expect(r?.text).not.toContain('開防火牆');
-    expect(formatJiraContent('TDDA-1971', fetched, '2026-11-17')).toBeNull();
+    expect(formatJiraContent('TDDA-1971', fetched, '2026-11-17', TZ)).toBeNull();
+  });
+
+  it('內文沒有日期行時，依留言建立時間（時區）納入整則留言', () => {
+    const fetched = {
+      summary: '[發票開立] 審核通過通知信',
+      comments: [
+        { author: 'Marcia', created: '2026-11-25T10:04:44.215+0800', body: '後端已部署至測試台，麻煩測試。\n\n## 請測試\n* 附件欄位' },
+        { author: 'Albert', created: '2026-11-25T14:26:38.564+0800', body: '已在測試台測試 test pass' },
+        { author: 'Old', created: '2026-11-24T23:59:00.000+0800', body: '前一天的留言' },
+      ],
+    };
+    const r = formatJiraContent('TDDA-2015', fetched, '2026-11-25', TZ);
+    expect(r?.count).toBe(2);
+    expect(r?.text).toContain('## 請測試');
+    expect(r?.text).toContain('test pass');
+    expect(r?.text).not.toContain('前一天');
+  });
+
+  it('內文有日期行時以內文為準，不看建立時間', () => {
+    const c = { author: 'SRE', created: '2026-11-16T10:00:00.000+0800', body: '2026/11/15\n* 開防火牆' };
+    expect(commentSectionsForDate(c, '2026-11-16', TZ)).toEqual([]);
+    expect(commentSectionsForDate(c, '2026-11-15', TZ)).toEqual(['* 開防火牆']);
+  });
+
+  it('建立時間依設定時區換算日期', () => {
+    // UTC 11/24 17:00 = 台北 11/25 01:00
+    expect(createdLocalDate('2026-11-24T17:00:00.000+0000', TZ)).toBe('2026-11-25');
+    expect(createdLocalDate('2026-11-25T01:00:00.000+0800', 'UTC')).toBe('2026-11-24');
+    expect(createdLocalDate('', TZ)).toBeNull();
+    expect(createdLocalDate('不是時間', TZ)).toBeNull();
+  });
+
+  it('建立時間無法解析或內文空白時不採用', () => {
+    expect(commentSectionsForDate({ author: 'x', created: '', body: '沒有日期' }, '2026-11-25', TZ)).toEqual([]);
+    expect(commentSectionsForDate({ author: 'x', created: '2026-11-25T10:00:00+0800', body: '  ' }, '2026-11-25', TZ)).toEqual([]);
   });
 });
 

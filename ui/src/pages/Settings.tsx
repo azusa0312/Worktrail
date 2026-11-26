@@ -9,6 +9,7 @@ import { applyTheme, useDebounced, useRunningJob, useToast } from '../lib/app';
 import { Banner, Button, Card, Confirm, cx, Field, IconButton, Input, Modal, PageHeader, Select, Skeleton, Tag } from '../components/ui';
 import { Link } from 'react-router-dom';
 import { JiraSyncButton, SweepButton } from './Today';
+import { JiraMcpPicker, needsJiraMcpSetup, useJiraMcp } from '../components/JiraMcpSetup';
 
 type Cfg = any;
 
@@ -759,10 +760,31 @@ function JiraSection({
           ))}
         </Select>
       </Row>
-      <Row label="Jira MCP 名稱" hint="查詢大型工作、「從 Jira 整理」時，claude CLI 透過這個 MCP 讀取 Jira（claude mcp list 中的名稱）">
-        <Input className="font-mono" {...bind('claude_cli.jira_mcp_server')} placeholder="atlassian-rovo-mcp" />
+      <Row label="Jira MCP" hint="Jira 活動同步、查詢大型工作、「從 Jira 整理」時，claude CLI 透過這個 MCP 讀取 Jira（claude mcp list 中的名稱）">
+        <JiraMcpRow />
       </Row>
     </Section>
+  );
+}
+
+/** 設定頁的 Jira MCP：顯示是否找得到，並可從已設定的 MCP 重新選擇 */
+function JiraMcpRow() {
+  const q = useJiraMcp();
+  if (!q.data) return <Skeleton className="h-8 w-64" />;
+  const s = q.data;
+  return (
+    <div className="space-y-2">
+      {needsJiraMcpSetup(s) ? (
+        <Banner tone="danger">
+          找不到「<b className="font-mono">{s.server}</b>」：請從下方選擇已設定的 Jira MCP，或依指令新增
+        </Banner>
+      ) : (
+        <div className="text-xs text-ink-3">
+          {s.found ? `✓ 已找到 ${s.server}` : `使用 ${s.server}（無法讀取 Claude Code 設定，未檢查）`}
+        </div>
+      )}
+      <JiraMcpPicker status={s} />
+    </div>
   );
 }
 

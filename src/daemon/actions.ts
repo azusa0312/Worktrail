@@ -1,8 +1,20 @@
 /**
  * 以 `claude -p` 執行的工作：補寫摘要（規格 5.3）、產生報告（規格 9.6）、範本試跑（規格 11.4）。
  */
-import { readFileSync } from 'node:fs';
-import { ClaudeCliError, extractJson, findClaude, runClaudePrint } from '../core/claude-cli/index.js';
+import { readFileSync, unlinkSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import {
+  ClaudeCliError,
+  extractJson,
+  findClaude,
+  findMcpServerConfig,
+  leanArgs,
+  listMcpServers,
+  type McpServerInfo,
+  runClaudePrint,
+  toolResultsFromStream,
+} from '../core/claude-cli/index.js';
 import { localDate } from '../core/capture/tz.js';
 import type { Period } from '../core/period/index.js';
 import { prepareReport, saveReport } from '../core/report/prepare.js';
@@ -24,9 +36,8 @@ import {
   fallbackItems,
   isUserEdited,
   ISSUE_BATCH,
-  IssuesOutput,
   issuesAllowedTools,
-  type IssuesOutput as IssuesOutputData,
+  issuesFromRaw,
   keysToFetch,
   mergeNote,
   upsertNoteTickets,
@@ -40,7 +51,7 @@ import {
 } from '../core/jira-activity/index.js';
 import { resolveProject } from '../core/capture/project.js';
 import type { Item, Task } from '../core/schema/task.js';
-import { withLock } from '../core/storage/fsutil.js';
+import { ensureDir, withLock, writeFileAtomic } from '../core/storage/fsutil.js';
 import { listTasks, readTask, taskLockKey, trashTask, writeTask } from '../core/storage/tasks.js';
 import { applyResolvedProject } from '../core/sync/projects.js';
 import { findTranscriptPath } from '../core/sync/locate.js';
@@ -55,6 +66,53 @@ import {
 } from '../core/ticket-info/index.js';
 import { parseTranscript } from '../core/transcript/index.js';
 import type { JobContext } from './jobs.js';
+
+/**
+ * 讀取 Jira 的 claude -p 參數。精簡模式（預設）只載入 Jira MCP 並用小模型；
+ * 找不到 Jira MCP 的設定（例如裝在別的 scope 或名稱不同）時退回完整模式，只限制 allowedTools。
+ */
+/** Claude Code 的使用者設定檔（~/.claude.json，MCP 伺服器設定在這裡）；讀不到時為 null */
+function readClaudeJson(): unknown {
+  try {
+    return JSON.parse(readFileSync(join(process.env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export interface JiraMcpStatus {
+  /** 設定中的 Jira MCP 名稱 */
+  server: string;
+  /** Claude Code 設定中找得到這個 MCP */
+  found: boolean;
+  /** 讀不到 ~/.claude.json（無法判斷） */
+  unknown: boolean;
+  /** 已設定的 MCP（Jira 類排前面），供重新選擇 */
+  servers: McpServerInfo[];
+}
+
+/** 檢查設定的 Jira MCP 是否存在；找不到時 UI 提示重新設定 */
+export function jiraMcpStatus(config: Config): JiraMcpStatus {
+  const server = config.claude_cli.jira_mcp_server || 'atlassian-rovo-mcp';
+  const json = readClaudeJson();
+  return { server, found: !!findMcpServerConfig(json, server), unknown: json === null, servers: listMcpServers(json) };
+}
+
+function jiraArgs(paths: StoragePaths, config: Config, allowedTools: string[]): string[] {
+  const fallback = ['--allowedTools', ...allowedTools];
+  if (!config.claude_cli.jira_lean) return fallback;
+  const server = config.claude_cli.jira_mcp_server || 'atlassian-rovo-mcp';
+  try {
+    const conf = findMcpServerConfig(readClaudeJson(), server);
+    if (!conf) return fallback;
+    ensureDir(paths.claudeRuns);
+    const file = join(paths.claudeRuns, 'jira-mcp.json');
+    writeFileAtomic(file, JSON.stringify({ mcpServers: { [server]: conf } }, null, 2));
+    return leanArgs({ mcpConfigPath: file, allowedTools, model: config.claude_cli.jira_model });
+  } catch {
+    return fallback;
+  }
+}
 
 async function claudePath(config: Config): Promise<string> {
   const p = await findClaude(config.claude_cli.path);
@@ -137,7 +195,7 @@ export async function jiraSummarizeTask(
     cwd: paths.claudeRuns,
     signal: ctx.signal,
     timeoutMs: 5 * 60_000,
-    extraArgs: ['--allowedTools', ...jiraAllowedTools(server)],
+    extraArgs: jiraArgs(paths, config, jiraAllowedTools(server)),
   });
   let json: unknown;
   try {
@@ -268,7 +326,7 @@ export async function refreshTicketInfo(
         cwd: paths.claudeRuns,
         signal: ctx.signal,
         timeoutMs: 5 * 60_000,
-        extraArgs: ['--allowedTools', ...ticketInfoAllowedTools(server)],
+        extraArgs: jiraArgs(paths, config, ticketInfoAllowedTools(server)),
       });
       const json = extractJson(raw);
       if (json && typeof json === 'object' && 'error' in json && !('tickets' in json)) {
@@ -313,6 +371,61 @@ export interface JiraSyncResult {
   errors: string[];
 }
 
+/**
+ * 請 claude -p 呼叫 getJiraIssue，從 stream-json 直接取得原始回傳（不經模型轉述）。
+ * 回傳太大時 Claude Code 會存成檔案，這裡讀檔後刪除。
+ */
+async function fetchIssuesRaw(
+  claude: string,
+  server: string,
+  keys: readonly string[],
+  paths: StoragePaths,
+  config: Config,
+  signal: AbortSignal,
+): Promise<{ issues: JiraIssueData[]; errors: Map<string, string> }> {
+  const stream = await runClaudePrint({
+    claudePath: claude,
+    prompt: buildIssuesPrompt(keys, server),
+    cwd: paths.claudeRuns,
+    signal,
+    timeoutMs: 5 * 60_000,
+    outputFormat: 'stream-json',
+    extraArgs: jiraArgs(paths, config, issuesAllowedTools(server)),
+  });
+  const issues: JiraIssueData[] = [];
+  const errors = new Map<string, string>();
+  for (const r of toolResultsFromStream(stream)) {
+    if (!r.name.endsWith('__getJiraIssue')) continue;
+    const asked = String((r.input as { issueIdOrKey?: unknown } | null)?.issueIdOrKey ?? '').trim().toUpperCase();
+    let text = r.text;
+    if (r.persistedPath) {
+      try {
+        text = readFileSync(r.persistedPath, 'utf8');
+      } catch (e) {
+        if (asked) errors.set(asked, `讀不到工具回傳檔：${(e as Error).message.slice(0, 120)}`);
+        continue;
+      }
+      try {
+        unlinkSync(r.persistedPath);
+      } catch {
+        /* 刪不掉不影響結果 */
+      }
+    }
+    if (r.isError) {
+      if (asked) errors.set(asked, text.replace(/\s+/g, ' ').slice(0, 200) || 'getJiraIssue 失敗');
+      continue;
+    }
+    try {
+      const got = issuesFromRaw(JSON.parse(text));
+      if (!got.length && asked) errors.set(asked, '回傳中沒有這張單');
+      issues.push(...got);
+    } catch (e) {
+      if (asked) errors.set(asked, `無法解析 getJiraIssue 回傳：${(e as Error).message.slice(0, 120)}`);
+    }
+  }
+  return { issues, errors };
+}
+
 /** 以 summary.jira_prompt 範本請 Claude 整理子項；失敗時丟出錯誤（由呼叫端退回固定格式） */
 async function aiItemsFor(
   paths: StoragePaths,
@@ -331,9 +444,19 @@ async function aiItemsFor(
     transcript: content,
     today: localDate(Date.now(), config.time.timezone),
   });
-  const out = await runClaudePrint({ claudePath: claude, prompt: g.guide, cwd: paths.claudeRuns, signal: ctx.signal, timeoutMs: 5 * 60_000 });
-  const input = SummaryInput.parse(extractJson(out));
-  return input.items;
+  const out = await runClaudePrint({
+    claudePath: claude,
+    prompt: g.guide,
+    cwd: paths.claudeRuns,
+    signal: ctx.signal,
+    timeoutMs: 5 * 60_000,
+    // 只是依範本整理子項：不需要任何工具、MCP 或使用者設定
+    extraArgs: config.claude_cli.jira_lean ? leanArgs({ mcpConfigPath: null, allowedTools: [] }) : [],
+  });
+  const json = extractJson(out);
+  // 模型認為沒有值得列的項目時會回空陣列：交給呼叫端改用固定格式，不算失敗
+  if (json && typeof json === 'object' && Array.isArray((json as { items?: unknown }).items) && !(json as { items: unknown[] }).items.length) return [];
+  return SummaryInput.parse(json).items;
 }
 
 /**
@@ -369,6 +492,11 @@ export async function syncJiraActivity(
   try {
     const claude = await claudePath(config);
     const server = config.claude_cli.jira_mcp_server || 'atlassian-rovo-mcp';
+    // 找不到 Jira MCP 時直接停下（不呼叫 claude，免得白花 token）；claude.ai 連接器不在 ~/.claude.json，不檢查
+    const mcp = jiraMcpStatus(config);
+    if (!mcp.found && !mcp.unknown && !/^claude[._ ]ai/i.test(server)) {
+      throw new Error(`找不到 Jira MCP「${server}」，請到設定 → Jira 重新選擇`);
+    }
 
     ctx.progress(`查詢 ${date} 的 Jira 活動…`);
     const raw = await runClaudePrint({
@@ -377,7 +505,7 @@ export async function syncJiraActivity(
       cwd: paths.claudeRuns,
       signal: ctx.signal,
       timeoutMs: 5 * 60_000,
-      extraArgs: ['--allowedTools', ...candidatesAllowedTools(server)],
+      extraArgs: jiraArgs(paths, config, candidatesAllowedTools(server)),
     });
     const json = extractJson(raw);
     if (json && typeof json === 'object' && 'error' in json && !('account_id' in json)) {
@@ -393,34 +521,26 @@ export async function syncJiraActivity(
       if (ctx.signal.aborted) throw new Error('已取消');
       const batch = keys.slice(i, i + ISSUE_BATCH);
       ctx.progress(`讀取單號 ${Math.min(i + batch.length, keys.length)}/${keys.length}…`);
-      try {
-        // 偶爾模型沒有照格式輸出：重試一次
-        let parsed: IssuesOutputData | undefined;
-        for (let attempt = 1; !parsed; attempt++) {
-          try {
-            const out = await runClaudePrint({
-              claudePath: claude,
-              prompt: buildIssuesPrompt(batch, date, server, candidates.account_id),
-              cwd: paths.claudeRuns,
-              signal: ctx.signal,
-              timeoutMs: 8 * 60_000,
-              extraArgs: ['--allowedTools', ...issuesAllowedTools(server)],
-            });
-            parsed = IssuesOutput.parse(extractJson(out));
-          } catch (e) {
-            if (attempt >= 2 || ctx.signal.aborted) throw e;
-          }
+      // 沒取到的單（模型漏呼叫、工具出錯）再試一次
+      let pending = batch;
+      let lastErr = new Map<string, string>();
+      for (let attempt = 1; attempt <= 2 && pending.length; attempt++) {
+        if (ctx.signal.aborted) throw new Error('已取消');
+        try {
+          const got = await fetchIssuesRaw(claude, server, pending, paths, config, ctx.signal);
+          issues.push(...got.issues);
+          const done = new Set(got.issues.map((x) => x.key.toUpperCase()));
+          lastErr = got.errors;
+          pending = pending.filter((k) => !done.has(k));
+        } catch (e) {
+          if (ctx.signal.aborted) throw e;
+          lastErr = new Map(pending.map((k) => [k, (e as Error).message.slice(0, 200)]));
         }
-        issues.push(...parsed.issues);
-        for (const e of parsed.errors) {
-          result.errors.push(`${e.key}：${e.error}`);
-          failed.set(e.key.trim().toUpperCase(), e.error.slice(0, 200));
-        }
-      } catch (e) {
-        if (ctx.signal.aborted) throw e;
-        const msg = (e as Error).message.slice(0, 200);
-        result.errors.push(`${batch.join(', ')}：${msg}`);
-        for (const k of batch) failed.set(k, msg);
+      }
+      for (const k of pending) {
+        const msg = lastErr.get(k) ?? '沒有取得 getJiraIssue 的結果';
+        failed.set(k, msg);
+        result.errors.push(`${k}：${msg}`);
       }
     }
 
@@ -443,7 +563,9 @@ export async function syncJiraActivity(
       if (!ja.ai_items) return fallback.length ? fallback : [{ text: `處理 ${a.ticket}`, status: 'done' }];
       try {
         ctx.progress(`整理 ${a.ticket} 的子項…`);
-        return await aiItemsFor(paths, config, claude, t, activityContent(a, date, tz), ctx);
+        const items = await aiItemsFor(paths, config, claude, t, activityContent(a, date, tz), ctx);
+        if (items.length) return items;
+        return fallback.length ? fallback : [{ text: `處理 ${a.ticket}`, status: 'done' }];
       } catch (e) {
         if (ctx.signal.aborted) throw e;
         result.errors.push(`${a.ticket} 子項整理失敗，改用固定格式：${(e as Error).message.slice(0, 120)}`);

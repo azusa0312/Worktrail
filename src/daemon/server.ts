@@ -63,7 +63,18 @@ import {
   writeTalk,
   type TalkRecord,
 } from '../core/talk/index.js';
-import { generateReport, generateTalk, jiraSummarizeTask, previewOutput, refreshTicketInfo, summarizeTask, summaryPromptFor, syncJiraActivity, type JiraSyncResult } from './actions.js';
+import {
+  generateReport,
+  generateTalk,
+  jiraMcpStatus,
+  jiraSummarizeTask,
+  previewOutput,
+  refreshTicketInfo,
+  summarizeTask,
+  summaryPromptFor,
+  syncJiraActivity,
+  type JiraSyncResult,
+} from './actions.js';
 import { datesNeedingSync, readSyncState } from '../core/jira-activity/index.js';
 import { TaskIndex, type ChangeEvent } from './index-cache.js';
 import { JobManager, type Job } from './jobs.js';
@@ -479,6 +490,17 @@ export function createDaemon(opts: DaemonOptions) {
     const running = jobs.findRunning('jira-sync', 'jira-sync');
     return { enabled: cfg().config.jira_activity.enabled, days, running: running ? running.id : null };
   });
+  // Jira MCP 是否存在：找不到時今日頁與設定頁提示重新設定
+  app.get('/api/jira-mcp', async () => jiraMcpStatus(cfg().config));
+  app.put('/api/jira-mcp', async (req) => {
+    const b = body(z.object({ server: z.string().trim().min(1).max(100) }), req);
+    const { config, error } = cfg();
+    if (error) throw new HttpError(400, '設定檔有誤，請先在設定頁修正');
+    await saveConfig(paths, { ...config, claude_cli: { ...config.claude_cli, jira_mcp_server: b.server } });
+    writeLog(paths, 'daemon', 'info', `Jira MCP 改為 ${b.server}`);
+    return jiraMcpStatus(cfg().config);
+  });
+
   app.post('/api/jira-sync', async (req) => {
     const b = body(
       z.object({ date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(), retry_failed: z.boolean().optional() }),

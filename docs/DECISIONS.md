@@ -370,3 +370,17 @@
 - 2026-11-25 修訂（重試會耗用大量 token）：原本只要有一張單讀取失敗，整天就標記失敗、每小時重讀全部單號。改為：
   - 部分單號讀取失敗：記在 `jira-sync.json` 的 `failed`（單號＋原因），那天視為已同步，**不自動重試**。今日頁列出失敗單號，按「重試這 N 張」只重新讀取那幾張（CLI：`jira-sync --failed` 列出、`--retry-failed` 重試）。重試時附加到既有任務的附註只更新該單的段落。
   - 整次失敗（例如 JQL 查詢失敗）：一小時後自動重試，總共最多 2 次（`attempts`），之後只顯示警告。
+- 2026-11-26 修訂（讀取單號失敗率高）：原本請模型把留言與 changelog 轉成 JSON 輸出。一張單的 getJiraIssue 回傳常有 50–65KB，Claude Code 會把它存成檔案只給模型路徑，模型得分段讀檔再轉述，常被截斷（「JSON 不完整」）或改寫腳本處理而沒輸出（「找不到 JSON」）。改為：
+  - `claude -p --output-format stream-json --verbose`，模型只負責呼叫工具並回覆 OK；程式用 `toolResultsFromStream` 取得 getJiraIssue 的原始回傳，太大被存成檔案時（`<persisted-output>…saved to:` 或 `Error: result … exceeds maximum allowed tokens. Output has been saved to …`）直接讀檔後刪除。
+  - `issuesFromRaw` 解析原始 `{issues:{nodes:[…]}}`（也接受單一 issue、ADF 留言），作者與日期過濾仍由 `myEventsOn` 處理。
+  - 每批改為 8 張；沒取到的單再試一次。實測：11/18–11/25 先前失敗的 16 張全部讀取成功，每批約 1–2 分鐘。
+- 2026-11-26 修訂（token 用量）：`claude -p` 預設會載入使用者全部設定（41 個內建工具、所有 MCP、22 個 skills、CLAUDE.md／記憶、Claude Code 完整系統提示），每輪約 43k token，讀一張單約 0.28 美元。改為精簡模式（`claude_cli.jira_lean`，預設開啟）：
+  - `--strict-mcp-config --mcp-config <只含 Jira MCP 的設定>`（從 `~/.claude.json` 取出，寫到 `claude-runs/jira-mcp.json`）、`--disable-slash-commands`、`--tools ToolSearch`（MCP 工具延遲載入需要它；不給 ToolSearch 時 MCP 還在連線中，模型拿不到工具）、`--system-prompt` 換成短提示、`--no-session-persistence`。
+  - 讀取 Jira 只需呼叫工具與輸出 JSON，模型用 `claude_cli.jira_model`（預設 haiku）。實測讀 3 張單：Sonnet 精簡 0.069 美元、Haiku 精簡 0.030 美元（完整設定讀 1 張就 0.28 美元）。
+  - 套用到：候選單號查詢、讀取單號、單號資訊（父卡片）查詢、「從 Jira 整理」。子項整理也用精簡模式（不載入任何工具與 MCP），但維持預設模型以保持文字品質。
+  - 找不到 Jira MCP 設定時自動退回完整模式。
+- 2026-11-26 找不到 Jira MCP 時提示重新設定：`GET /api/jira-mcp` 檢查 `claude_cli.jira_mcp_server` 是否在 `~/.claude.json`（使用者層級或任一專案層級）中，並列出已設定的 MCP（名稱或指令含 atlassian／jira 的排前面）。找不到時：
+  - 今日頁頂端顯示紅色提示，可直接從下拉選單選擇已設定的 Jira MCP 並套用（`PUT /api/jira-mcp`）；完全沒有 Jira MCP 時顯示新增指令。設定頁 Jira 區塊同樣顯示狀態與選單。
+  - Jira 活動同步在呼叫 claude 之前就停下並記錄錯誤，不白花 token。
+  - 讀不到 `~/.claude.json`（無法判斷）或名稱是 claude.ai 連接器時不提示。
+  - 子項整理回傳空陣列時改用固定格式，不再記為失敗。

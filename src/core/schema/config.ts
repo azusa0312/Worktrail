@@ -155,6 +155,13 @@ export const Config = z.object({
       path: z.string().default(''),
       /** 「從 Jira 整理」使用的 Jira MCP 伺服器名稱（claude mcp list 中的名稱） */
       jira_mcp_server: z.string().default('atlassian-rovo-mcp'),
+      /**
+       * 讀取 Jira 時用精簡模式：只載入 Jira MCP、不載入其他 MCP／skills／CLAUDE.md，並取代預設系統提示。
+       * 找不到 Jira MCP 設定時自動退回完整模式。
+       */
+      jira_lean: z.boolean().default(true),
+      /** 讀取 Jira 用的模型（只負責呼叫工具與輸出 JSON，用小模型即可）；空字串為 Claude Code 預設模型 */
+      jira_model: z.string().default('haiku'),
     })
     .prefault({}),
 

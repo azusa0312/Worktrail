@@ -14,6 +14,7 @@ import {
   jiraSessionId,
   keysToFetch,
   mergeNote,
+  issuesFromRaw,
   upsertNoteTickets,
   activityNote,
   myEventsOn,
@@ -26,6 +27,7 @@ import {
   type JiraActivity,
   type JiraIssueData,
 } from '../src/core/jira-activity/index.js';
+import { findMcpServerConfig, leanArgs, listMcpServers, toolResultsFromStream } from '../src/core/claude-cli/index.js';
 import { Config } from '../src/core/schema/config.js';
 import { reresolveProject } from '../src/core/sync/projects.js';
 import { makeEnv, type TestEnv } from './env.js';
@@ -332,5 +334,149 @@ describe('同步狀態檔', () => {
     const s = readSyncState(env.paths);
     expect(s.days['2026-11-25']!.created).toEqual(['TDDA-2015']);
     expect(s.dismissed).toEqual(['2026-11-25:TDDA-1']);
+  });
+});
+
+describe('直接讀取 getJiraIssue 原始回傳', () => {
+  const me = '712020:me';
+  const raw = {
+    issues: {
+      nodes: [
+        {
+          key: 'TDDA-1923',
+          fields: {
+            summary: '[採購請款] 新增「複製採購單」功能',
+            issuetype: { name: '任務' },
+            status: { name: 'Ready to prod' },
+            comment: {
+              total: 2,
+              comments: [
+                { author: { accountId: me, displayName: 'albertweng' }, created: '2026-11-20T17:42:00.619+0800', body: '已在測試台測試 test pass' },
+                { author: { accountId: 'other', displayName: 'Marcia' }, created: '2026-11-20T10:00:00.000+0800', body: '請幫忙測試' },
+              ],
+            },
+          },
+          changelog: {
+            histories: [
+              {
+                author: { accountId: me, displayName: 'albertweng' },
+                created: '2026-11-20T18:17:34.118+0800',
+                items: [{ field: 'assignee', fromString: 'albertweng', toString: 'Marcia Chou' }],
+              },
+              {
+                author: { accountId: me, displayName: 'albertweng' },
+                created: '2026-11-19T09:00:00.000+0800',
+                items: [{ field: 'status', fromString: 'In Progress', toString: 'Done' }],
+              },
+            ],
+          },
+        },
+      ],
+    },
+  };
+
+  it('轉成 JiraIssueData，事件由程式依作者與日期過濾', () => {
+    const [issue] = issuesFromRaw(raw);
+    expect(issue).toMatchObject({ key: 'TDDA-1923', type: '任務', status: 'Ready to prod' });
+    expect(issue!.comments).toHaveLength(2);
+    expect(issue!.histories[0]!.items[0]).toEqual({ field: 'assignee', from: 'albertweng', to: 'Marcia Chou' });
+    const events = myEventsOn(issue!, me, '2026-11-20', TZ, { ignoreFields: [], createdKeys: new Set() });
+    expect(events.map((e) => e.kind).sort()).toEqual(['comment', 'field']);
+  });
+
+  it('單一 issue 物件與 ADF 留言也能解析；不認得的格式回傳空陣列', () => {
+    const single = {
+      key: 'TDDA-1',
+      fields: {
+        summary: 'x',
+        comment: { comments: [{ author: { accountId: me }, created: '2026-11-20T10:00:00+0800', body: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'ADF 留言' }] }] } }] },
+      },
+    };
+    expect(issuesFromRaw(single)[0]!.comments[0]!.body).toBe('ADF 留言');
+    expect(issuesFromRaw({ foo: 1 })).toEqual([]);
+    expect(issuesFromRaw(null)).toEqual([]);
+  });
+
+  it('從 stream-json 取出工具回傳（含存成檔案的大型回傳）', () => {
+    const line = (o: unknown) => JSON.stringify(o);
+    const stream = [
+      line({ type: 'system', subtype: 'init' }),
+      line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'mcp__s__getJiraIssue', input: { issueIdOrKey: 'TDDA-1' } }] } }),
+      line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: '{"key":"TDDA-1"}' }] }] } }),
+      line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'mcp__s__getJiraIssue', input: { issueIdOrKey: 'TDDA-2' } }] } }),
+      line({
+        type: 'user',
+        message: {
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 't2',
+              content: '<persisted-output>\nOutput too large (55.5KB). Full output saved to: C:\\Users\\me\\.claude\\projects\\x\\tool-results\\toolu_2.txt\n\nPreview (first 2KB):\n{"issues"\n...\n</persisted-output>',
+            },
+          ],
+        },
+      }),
+      line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't3', name: 'mcp__s__getJiraIssue', input: { issueIdOrKey: 'TDDA-3' } }] } }),
+      line({
+        type: 'user',
+        message: {
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 't3',
+              content:
+                'Error: result (64,928 characters) exceeds maximum allowed tokens. Output has been saved to C:\\tmp\\tool-results\\mcp-getJiraIssue-1.txt.\nFormat: JSON with schema: {issues: {nodes: [{...}]}}\n- use jq',
+            },
+          ],
+        },
+      }),
+      line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'zz', content: 'orphan' }] } }),
+      'not json',
+    ].join('\n');
+    const r = toolResultsFromStream(stream);
+    expect(r).toHaveLength(3);
+    expect(r[2]!.persistedPath).toBe('C:\\tmp\\tool-results\\mcp-getJiraIssue-1.txt');
+    expect(r[0]).toMatchObject({ name: 'mcp__s__getJiraIssue', input: { issueIdOrKey: 'TDDA-1' }, text: '{"key":"TDDA-1"}', isError: false });
+    expect(r[0]!.persistedPath).toBeUndefined();
+    expect(r[1]!.persistedPath).toBe('C:\\Users\\me\\.claude\\projects\\x\\tool-results\\toolu_2.txt');
+  });
+});
+
+describe('精簡模式參數', () => {
+  it('從 ~/.claude.json 找 MCP 設定：使用者層級優先，其次專案層級', () => {
+    const user = { type: 'stdio', command: 'npx', args: ['-y', 'mcp-remote'] };
+    expect(findMcpServerConfig({ mcpServers: { jira: user } }, 'jira')).toEqual(user);
+    expect(findMcpServerConfig({ projects: { a: { mcpServers: { jira: user } } } }, 'jira')).toEqual(user);
+    expect(findMcpServerConfig({ mcpServers: {} }, 'jira')).toBeNull();
+    expect(findMcpServerConfig(null, 'jira')).toBeNull();
+  });
+
+  it('只載入指定 MCP、保留 ToolSearch、指定模型；不需要 MCP 時關閉全部工具', () => {
+    const a = leanArgs({ mcpConfigPath: 'm.json', allowedTools: ['mcp__s__getJiraIssue'], model: 'haiku' });
+    expect(a).toEqual(expect.arrayContaining(['--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence']));
+    expect(a.slice(a.indexOf('--mcp-config'), a.indexOf('--mcp-config') + 2)).toEqual(['--mcp-config', 'm.json']);
+    expect(a[a.indexOf('--tools') + 1]).toBe('ToolSearch');
+    expect(a[a.indexOf('--model') + 1]).toBe('haiku');
+    expect(a.slice(-2)).toEqual(['--allowedTools', 'mcp__s__getJiraIssue']);
+    const b = leanArgs({ mcpConfigPath: null, allowedTools: [] });
+    expect(b).not.toContain('--mcp-config');
+    expect(b[b.indexOf('--tools') + 1]).toBe('');
+    expect(b).not.toContain('--model');
+    expect(b).not.toContain('--allowedTools');
+  });
+});
+
+describe('列出已設定的 MCP', () => {
+  it('Jira 類排前面、同名只列一次（使用者層級優先）', () => {
+    const json = {
+      mcpServers: { figma: { url: 'https://figma' }, 'my-jira': { args: ['mcp-remote', 'https://mcp.atlassian.com/v1/mcp'] } },
+      projects: { a: { mcpServers: { figma: {}, gitlab: {} } } },
+    };
+    expect(listMcpServers(json)).toEqual([
+      { name: 'my-jira', scope: 'user', jira: true },
+      { name: 'figma', scope: 'user', jira: false },
+      { name: 'gitlab', scope: 'project', jira: false },
+    ]);
+    expect(listMcpServers(null)).toEqual([]);
   });
 });

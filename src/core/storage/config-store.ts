@@ -72,6 +72,8 @@ summary:
 claude_cli:
   path: ""                      # 空白表示從 PATH 自動尋找
   jira_mcp_server: atlassian-rovo-mcp   # 「從 Jira 整理」使用的 Jira MCP 名稱
+  jira_lean: true               # 讀取 Jira 時只載入 Jira MCP（不載入其他 MCP、skills、CLAUDE.md），大幅節省 token
+  jira_model: haiku             # 讀取 Jira 用的模型；空白為 Claude Code 預設模型
 
 ui:
   port: 4870

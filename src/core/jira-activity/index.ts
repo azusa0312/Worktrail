@@ -21,7 +21,7 @@ import { emptyTask } from '../sync/merge.js';
 // ───────────── 抓取（claude -p 指示與輸出）
 
 /** 一次 claude -p 讀取的單號數上限 */
-export const ISSUE_BATCH = 4;
+export const ISSUE_BATCH = 8;
 /** 候選單號上限（超過時只處理最近更新的） */
 export const MAX_CANDIDATES = 50;
 
@@ -70,24 +70,85 @@ export function buildCandidatesPrompt(date: string, server: string, projectKeys:
 查詢失敗時輸出 {"error": "原因（含工具回傳的錯誤訊息）"}。`;
 }
 
-export function buildIssuesPrompt(keys: readonly string[], date: string, server: string, accountId: string): string {
-  const since = addDays(date, -1);
+/**
+ * 讀取單號：只請模型呼叫工具，不轉述內容。程式從 stream-json 直接取得 getJiraIssue 的原始回傳
+ * （見 claude-cli 的 toolResultsFromStream 與 issuesFromRaw）。
+ * 以前請模型把留言與 changelog 轉成 JSON 輸出，單子變更多時常被截斷（「JSON 不完整」）或放棄（「找不到 JSON」）。
+ */
+export function buildIssuesPrompt(keys: readonly string[], server: string): string {
   return `請用 Jira MCP（${server}）讀取下列 Jira 單號，不要修改任何 Jira 資料。
 
 單號：${keys.join(', ')}
 
 步驟：
 1. 呼叫 getAccessibleAtlassianResources 取得 cloudId（選有 read:jira-work 權限的站台）。
-2. 對每個單號呼叫 getJiraIssue：fields=["summary","status","issuetype","comment"]、expand="changelog"、responseContentFormat="markdown"。
-   若留言總數多於回傳數量，請繼續取得其餘留言。
+2. 對每個單號各呼叫一次 getJiraIssue：issueIdOrKey=單號、fields=["summary","status","issuetype","comment"]、expand="changelog"、responseContentFormat="markdown"。
 
-只保留作者 accountId 為 ${accountId}、且建立時間（created）日期在 ${since} 或之後的留言與變更紀錄（changelog.histories），其餘全部略過（不要輸出）。
-只輸出一個 JSON 物件，不要有其他文字或 Markdown 程式碼框：
-{"issues": [{"key": "單號", "summary": "標題", "type": "類型名稱", "status": "目前狀態",
-  "comments": [{"author_id": "留言者 accountId", "author": "顯示名稱", "created": "建立時間（原樣）", "body": "留言內文（markdown 原文，保留換行，不要改寫或摘要；超過 2000 字可截斷）"}],
-  "histories": [{"author_id": "變更者 accountId", "author": "顯示名稱", "created": "建立時間（原樣）", "items": [{"field": "欄位名稱", "from": "fromString", "to": "toString"}]}]}],
- "errors": [{"key": "單號", "error": "原因"}]}
-查不到的單號放在 errors。`;
+結果由程式直接讀取工具回傳：不需要閱讀、整理或轉述內容（回傳被存成檔案時也不要去讀檔），每個單號都呼叫過後只回覆 OK。`;
+}
+
+/** ADF（Atlassian Document Format）物件轉純文字；沒有要求 markdown 時留言會是這種格式 */
+function adfText(node: unknown): string {
+  if (typeof node === 'string') return node;
+  if (!node || typeof node !== 'object') return '';
+  const n = node as { type?: string; text?: string; content?: unknown[] };
+  if (n.type === 'text') return n.text ?? '';
+  const inner = (n.content ?? []).map(adfText).join('');
+  return ['paragraph', 'heading', 'listItem', 'codeBlock', 'blockquote'].includes(n.type ?? '') ? `${inner}\n` : inner;
+}
+
+/**
+ * 把 getJiraIssue 的原始回傳（`{issues:{nodes:[…]}}` 或單一 issue 物件）轉成 JiraIssueData。
+ * 留言與變更紀錄全部保留，由 myEventsOn 依作者與日期過濾。
+ */
+export function issuesFromRaw(raw: unknown): JiraIssueData[] {
+  if (!raw || typeof raw !== 'object') return [];
+  const r = raw as Record<string, unknown>;
+  const issuesField = r.issues as { nodes?: unknown[] } | unknown[] | undefined;
+  const nodes: unknown[] = Array.isArray(issuesField)
+    ? issuesField
+    : Array.isArray(issuesField?.nodes)
+      ? issuesField.nodes
+      : typeof r.key === 'string'
+        ? [r]
+        : [];
+  const s = (v: unknown) => (typeof v === 'string' ? v : '');
+  const out: JiraIssueData[] = [];
+  for (const node of nodes) {
+    const n = node as {
+      key?: unknown;
+      fields?: Record<string, any>;
+      changelog?: { histories?: any[] };
+    };
+    if (typeof n?.key !== 'string' || !n.key) continue;
+    const f = n.fields ?? {};
+    const comments = Array.isArray(f.comment?.comments) ? f.comment.comments : Array.isArray(f.comment) ? f.comment : [];
+    out.push(
+      JiraIssueData.parse({
+        key: n.key,
+        summary: s(f.summary),
+        type: s(f.issuetype?.name),
+        status: s(f.status?.name),
+        comments: comments.map((c: any) => ({
+          author_id: s(c?.author?.accountId),
+          author: s(c?.author?.displayName),
+          created: s(c?.created),
+          body: adfText(c?.body).trim(),
+        })),
+        histories: (n.changelog?.histories ?? []).map((h: any) => ({
+          author_id: s(h?.author?.accountId),
+          author: s(h?.author?.displayName),
+          created: s(h?.created),
+          items: (Array.isArray(h?.items) ? h.items : []).map((i: any) => ({
+            field: s(i?.field),
+            from: s(i?.fromString),
+            to: s(i?.toString),
+          })),
+        })),
+      }),
+    );
+  }
+  return out;
 }
 
 export const CandidatesOutput = z.object({

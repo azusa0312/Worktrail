@@ -15,6 +15,7 @@ import { NewTaskButton } from '../components/NewTaskDialog';
 import { Banner, Button, EmptyState, PageHeader, Skeleton } from '../components/ui';
 import { useListNavigation } from './Log';
 import { useOpenTask } from '../lib/useOpenTask';
+import { JiraMcpWarning } from '../components/JiraMcpSetup';
 
 export function SweepButton() {
   const { track } = useJobs();
@@ -177,6 +178,7 @@ export function TodayPage() {
         </Banner>
       )}
       <TicketKeySuggestion />
+      <JiraMcpWarning />
       <JiraSyncWarning />
 
       {tasks.isLoading ? (
